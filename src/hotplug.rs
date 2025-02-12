@@ -30,6 +30,9 @@ pub enum HotplugEvent {
     /// A device has been connected.
     Connected(DeviceInfo),
 
+    /// Serial device connected
+    SerialConnected(DeviceInfo),
+
     /// A device has been disconnected.
     Disconnected(DeviceId),
 }

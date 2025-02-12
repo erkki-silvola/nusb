@@ -22,6 +22,7 @@ use windows_sys::Win32::{
         Usb::GUID_DEVINTERFACE_USB_DEVICE,
     },
     Foundation::ERROR_SUCCESS,
+    System::Ioctl::GUID_DEVINTERFACE_COMPORT,
 };
 
 use crate::{
@@ -37,6 +38,7 @@ use super::DevInst;
 pub(crate) struct WindowsHotplugWatch {
     inner: *mut HotplugInner,
     registration: HCMNOTIFICATION,
+    registration_com: HCMNOTIFICATION,
 }
 
 struct HotplugInner {
@@ -47,6 +49,7 @@ struct HotplugInner {
 #[derive(Debug)]
 enum Action {
     Connect,
+    SerialConnect,
     Disconnect,
 }
 
@@ -87,9 +90,40 @@ impl WindowsHotplugWatch {
             ));
         }
 
+        let mut registration_com = ptr::null_mut();
+        let filter_com = CM_NOTIFY_FILTER {
+            cbSize: size_of::<CM_NOTIFY_FILTER>() as u32,
+            Flags: 0,
+            FilterType: CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE,
+            Reserved: 0,
+            u: CM_NOTIFY_FILTER_0 {
+                DeviceInterface: CM_NOTIFY_FILTER_0_2 {
+                    ClassGuid: GUID_DEVINTERFACE_COMPORT,
+                },
+            },
+        };
+
+        let cr_com = unsafe {
+            CM_Register_Notification(
+                &filter_com,
+                inner as *mut c_void,
+                Some(hotplug_callback_serial),
+                &mut registration_com,
+            )
+        };
+
+        if cr_com != CR_SUCCESS {
+            error!("CM_Register_Notification for comport failed: {cr}");
+            return Err(Error::new(
+                ErrorKind::Other,
+                "Failed to initialize hotplug notifications",
+            ));
+        }
+
         Ok(WindowsHotplugWatch {
             inner,
             registration,
+            registration_com,
         })
     }
 
@@ -104,6 +138,11 @@ impl WindowsHotplugWatch {
             Some((Action::Connect, devinst)) => {
                 if let Some(dev) = probe_device(devinst) {
                     return Poll::Ready(HotplugEvent::Connected(dev));
+                };
+            }
+            Some((Action::SerialConnect, devinst)) => {
+                if let Some(dev) = probe_device(devinst) {
+                    return Poll::Ready(HotplugEvent::SerialConnected(dev));
                 };
             }
             Some((Action::Disconnect, devinst)) => {
@@ -129,6 +168,7 @@ impl Drop for WindowsHotplugWatch {
             // immediately afterward without races.
             // [1]: https://learn.microsoft.com/en-us/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_unregister_notification
             CM_Unregister_Notification(self.registration);
+            CM_Unregister_Notification(self.registration_com);
             drop(Box::from_raw(self.inner));
         }
     }
@@ -163,5 +203,40 @@ unsafe extern "system" fn hotplug_callback(
     debug!("Hotplug callback: action={action:?}, instance={device_instance}");
     inner.events.lock().unwrap().push_back((action, devinst));
     inner.waker.wake();
+    return ERROR_SUCCESS;
+}
+
+unsafe extern "system" fn hotplug_callback_serial(
+    _hnotify: HCMNOTIFICATION,
+    context: *const ::core::ffi::c_void,
+    action: CM_NOTIFY_ACTION,
+    eventdata: *const CM_NOTIFY_EVENT_DATA,
+    _eventdatasize: u32,
+) -> u32 {
+    let inner = unsafe { &*(context as *const HotplugInner) };
+
+    let action = match action {
+        CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL => Action::SerialConnect,
+        _ => {
+            debug!("Hotplug callback: unknown or unhandled action {action}");
+            return ERROR_SUCCESS;
+        }
+    };
+
+    let device_interface =
+        unsafe { WCStr::from_ptr(addr_of!((*eventdata).u.DeviceInterface.SymbolicLink[0])) };
+
+    let device_instance =
+        get_device_interface_property::<WCString>(device_interface, DEVPKEY_Device_InstanceId)
+            .unwrap();
+    let devinst = DevInst::from_instance_id(&device_instance).unwrap();
+
+    if let Some(parent) = devinst.parent() {
+        debug!("Hotplug com callback: action={action:?}, instance={device_instance}");
+        inner.events.lock().unwrap().push_back((action, parent));
+        inner.waker.wake();
+    } else {
+        debug!("Hotplug com callback no parent devinst found: action={action:?}, instance={device_instance}");
+    }
     return ERROR_SUCCESS;
 }
