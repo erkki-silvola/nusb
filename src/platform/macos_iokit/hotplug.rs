@@ -153,9 +153,10 @@ impl MacHotplugWatch {
         }
 
         if let Some(s) = self.terminated_iter.next() {
-            if let Some(dev) = probe_device(s) {
-                debug!("device {dev:?} disconnected");
-                return Poll::Ready(HotplugEvent::Disconnected(dev));
+            if let Some(registry_id) = get_registry_id(&s) {
+                debug!("device {registry_id} disconnected");
+                let id = DeviceId(registry_id);
+                return Poll::Ready(HotplugEvent::Disconnected(id));
             } else {
                 debug!("failed to get registry ID for disconnected device")
             }
