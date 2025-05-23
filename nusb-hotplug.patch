@@ -1,0 +1,227 @@
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 72f3d90..ec43564 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -26,7 +26,7 @@ rustix = { version = "0.38.17", features = ["fs", "event", "net"] }
+ libc = "0.2.155"
+ 
+ [target.'cfg(target_os="windows")'.dependencies]
+-windows-sys = { version = "0.48.0", features = ["Win32_Devices_Usb", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Devices_Properties", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO", "Win32_System_Registry", "Win32_System_Com"] }
++windows-sys = { version = "0.48.0", features = ["Win32_Devices_Usb", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Devices_Properties", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Registry", "Win32_System_Com"] }
+ 
+ [target.'cfg(target_os="macos")'.dependencies]
+ core-foundation = "0.9.3"
+diff --git a/src/hotplug.rs b/src/hotplug.rs
+index 8a8d314..363ddf4 100644
+--- a/src/hotplug.rs
++++ b/src/hotplug.rs
+@@ -30,6 +30,9 @@ pub enum HotplugEvent {
+     /// A device has been connected.
+     Connected(DeviceInfo),
+ 
++    /// Serial device connected
++    SerialConnected(DeviceInfo),
++
+     /// A device has been disconnected.
+     Disconnected(DeviceId),
+ }
+diff --git a/src/platform/macos_iokit/hotplug.rs b/src/platform/macos_iokit/hotplug.rs
+index 175b9be..4e31ec1 100644
+--- a/src/platform/macos_iokit/hotplug.rs
++++ b/src/platform/macos_iokit/hotplug.rs
+@@ -8,6 +8,7 @@ use std::{
+ 
+ use atomic_waker::AtomicWaker;
+ use core_foundation::{base::TCFType, dictionary::CFDictionary, runloop::CFRunLoopSource};
++use io_kit_sys::serial::keys::kIOSerialBSDServiceValue;
+ use io_kit_sys::{
+     kIOMasterPortDefault,
+     keys::{kIOFirstMatchNotification, kIOTerminatedNotification},
+@@ -54,6 +55,7 @@ pub(crate) struct MacHotplugWatch {
+     waker_id: SlabWaker,
+     terminated_iter: IoServiceIterator,
+     matched_iter: IoServiceIterator,
++    cdc_matched_iter: IoServiceIterator,
+     _registration: EventRegistration,
+     _notification_port: NotificationPort,
+ }
+@@ -86,6 +88,14 @@ impl MacHotplugWatch {
+             CFDictionary::wrap_under_create_rule(d)
+         };
+ 
++        let cdc_dictionary = unsafe {
++            let d = IOServiceMatching(kIOSerialBSDServiceValue);
++            if d.is_null() {
++                return Err(Error::new(ErrorKind::Other, "IOServiceMatching failed"));
++            }
++            CFDictionary::wrap_under_create_rule(d)
++        };
++
+         let notification_port = NotificationPort::new();
+         let terminated_iter = register_notification(
+             &notification_port,
+@@ -99,6 +109,12 @@ impl MacHotplugWatch {
+             &waker_id,
+             kIOFirstMatchNotification,
+         )?;
++        let cdc_matched_iter = register_notification(
++            &notification_port,
++            &cdc_dictionary,
++            &waker_id,
++            kIOFirstMatchNotification,
++        )?;
+ 
+         let source = unsafe {
+             CFRunLoopSource::wrap_under_get_rule(IONotificationPortGetRunLoopSource(
+@@ -111,6 +127,7 @@ impl MacHotplugWatch {
+             waker_id,
+             terminated_iter,
+             matched_iter,
++            cdc_matched_iter,
+             _registration: registration,
+             _notification_port: notification_port,
+         })
+@@ -127,6 +144,14 @@ impl MacHotplugWatch {
+             }
+         }
+ 
++        while let Some(s) = self.cdc_matched_iter.next() {
++            if let Some(dev) = probe_device(s) {
++                return Poll::Ready(HotplugEvent::SerialConnected(dev));
++            } else {
++                debug!("failed to probe serial connected device");
++            }
++        }
++
+         if let Some(s) = self.terminated_iter.next() {
+             if let Some(registry_id) = get_registry_id(&s) {
+                 debug!("device {registry_id} disconnected");
+diff --git a/src/platform/windows_winusb/hotplug.rs b/src/platform/windows_winusb/hotplug.rs
+index 3a52843..e553302 100644
+--- a/src/platform/windows_winusb/hotplug.rs
++++ b/src/platform/windows_winusb/hotplug.rs
+@@ -22,6 +22,7 @@ use windows_sys::Win32::{
+         Usb::GUID_DEVINTERFACE_USB_DEVICE,
+     },
+     Foundation::ERROR_SUCCESS,
++    System::Ioctl::GUID_DEVINTERFACE_COMPORT,
+ };
+ 
+ use crate::{
+@@ -37,6 +38,7 @@ use super::DevInst;
+ pub(crate) struct WindowsHotplugWatch {
+     inner: *mut HotplugInner,
+     registration: HCMNOTIFICATION,
++    registration_com: HCMNOTIFICATION,
+ }
+ 
+ struct HotplugInner {
+@@ -47,6 +49,7 @@ struct HotplugInner {
+ #[derive(Debug)]
+ enum Action {
+     Connect,
++    SerialConnect,
+     Disconnect,
+ }
+ 
+@@ -87,9 +90,40 @@ impl WindowsHotplugWatch {
+             ));
+         }
+ 
++        let mut registration_com = 0;
++        let filter_com = CM_NOTIFY_FILTER {
++            cbSize: size_of::<CM_NOTIFY_FILTER>() as u32,
++            Flags: 0,
++            FilterType: CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE,
++            Reserved: 0,
++            u: CM_NOTIFY_FILTER_0 {
++                DeviceInterface: CM_NOTIFY_FILTER_0_2 {
++                    ClassGuid: GUID_DEVINTERFACE_COMPORT,
++                },
++            },
++        };
++
++        let cr_com = unsafe {
++            CM_Register_Notification(
++                &filter_com,
++                inner as *mut c_void,
++                Some(hotplug_callback_serial),
++                &mut registration_com,
++            )
++        };
++
++        if cr_com != CR_SUCCESS {
++            error!("CM_Register_Notification for comport failed: {cr}");
++            return Err(Error::new(
++                ErrorKind::Other,
++                "Failed to initialize hotplug notifications",
++            ));
++        }
++
+         Ok(WindowsHotplugWatch {
+             inner,
+             registration,
++            registration_com,
+         })
+     }
+ 
+@@ -106,6 +140,11 @@ impl WindowsHotplugWatch {
+                     return Poll::Ready(HotplugEvent::Connected(dev));
+                 };
+             }
++            Some((Action::SerialConnect, devinst)) => {
++                if let Some(dev) = probe_device(devinst) {
++                    return Poll::Ready(HotplugEvent::SerialConnected(dev));
++                };
++            }
+             Some((Action::Disconnect, devinst)) => {
+                 return Poll::Ready(HotplugEvent::Disconnected(DeviceId(devinst)));
+             }
+@@ -129,6 +168,7 @@ impl Drop for WindowsHotplugWatch {
+             // immediately afterward without races.
+             // [1]: https://learn.microsoft.com/en-us/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_unregister_notification
+             CM_Unregister_Notification(self.registration);
++            CM_Unregister_Notification(self.registration_com);
+             drop(Box::from_raw(self.inner));
+         }
+     }
+@@ -165,3 +205,38 @@ unsafe extern "system" fn hotplug_callback(
+     inner.waker.wake();
+     return ERROR_SUCCESS;
+ }
++
++unsafe extern "system" fn hotplug_callback_serial(
++    _hnotify: HCMNOTIFICATION,
++    context: *const ::core::ffi::c_void,
++    action: CM_NOTIFY_ACTION,
++    eventdata: *const CM_NOTIFY_EVENT_DATA,
++    _eventdatasize: u32,
++) -> u32 {
++    let inner = unsafe { &*(context as *const HotplugInner) };
++
++    let action = match action {
++        CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL => Action::SerialConnect,
++        _ => {
++            debug!("Hotplug callback: unknown or unhandled action {action}");
++            return ERROR_SUCCESS;
++        }
++    };
++
++    let device_interface =
++        unsafe { WCStr::from_ptr(addr_of!((*eventdata).u.DeviceInterface.SymbolicLink[0])) };
++
++    let device_instance =
++        get_device_interface_property::<WCString>(device_interface, DEVPKEY_Device_InstanceId)
++            .unwrap();
++    let devinst = DevInst::from_instance_id(&device_instance).unwrap();
++
++    if let Some(parent) = devinst.parent() {
++        debug!("Hotplug com callback: action={action:?}, instance={device_instance}");
++        inner.events.lock().unwrap().push_back((action, parent));
++        inner.waker.wake();
++    } else {
++        debug!("Hotplug com callback no parent devinst found: action={action:?}, instance={device_instance}");
++    }
++    return ERROR_SUCCESS;
++}
