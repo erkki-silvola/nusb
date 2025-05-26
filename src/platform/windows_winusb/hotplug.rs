@@ -233,9 +233,11 @@ unsafe extern "system" fn hotplug_callback_serial(
     if let Some(parent) = devinst.parent() {
         debug!("Hotplug com callback: action={action:?}, instance={device_instance}");
         inner.events.lock().unwrap().push_back((action, parent));
-        inner.waker.wake();
+        if let Some(w) = inner.waker.lock().unwrap().take() {
+            w.wake()
+        }
     } else {
         debug!("Hotplug com callback no parent devinst found: action={action:?}, instance={device_instance}");
     }
-    return ERROR_SUCCESS;
+    ERROR_SUCCESS
 }
