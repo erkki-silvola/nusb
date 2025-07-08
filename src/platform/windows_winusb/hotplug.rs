@@ -112,10 +112,14 @@ impl WindowsHotplugWatch {
         };
 
         if cr_com != CR_SUCCESS {
-            error!("CM_Register_Notification for comport failed: {cr}");
-            return Err(Error::other("Failed to initialize hotplug notifications"));
+            return Err(Error::new_os(
+                crate::ErrorKind::Other,
+                "failed to initialize hotplug notifications for serial",
+                cr,
+            )
+            .log_error());
         }
-        
+
         Ok(WindowsHotplugWatch {
             inner,
             registration,
