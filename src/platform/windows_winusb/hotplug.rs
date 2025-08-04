@@ -96,7 +96,7 @@ impl WindowsHotplugWatch {
             FilterType: CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE,
             Reserved: 0,
             u: CM_NOTIFY_FILTER_0 {
-                DeviceInterface: CM_NOTIFY_FILTER_0_2 {
+                DeviceInterface: CM_NOTIFY_FILTER_0_0 {
                     ClassGuid: GUID_DEVINTERFACE_COMPORT,
                 },
             },
