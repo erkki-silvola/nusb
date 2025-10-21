@@ -16,6 +16,7 @@ use crate::{
         DESCRIPTOR_TYPE_CONFIGURATION, DESCRIPTOR_TYPE_STRING,
     },
     maybe_future::{blocking::Blocking, MaybeFuture},
+    platform::windows_winusb::util::WCStr,
     BusInfo, DeviceInfo, Error, ErrorKind, InterfaceInfo, UsbControllerType,
 };
 
@@ -50,6 +51,41 @@ pub fn list_buses() -> impl MaybeFuture<Output = Result<impl Iterator<Item = Bus
             .collect();
         Ok(devs.into_iter())
     })
+}
+
+pub fn probe_serial_device(devinst: DevInst) -> Option<DeviceInfo> {
+    let instance_id = devinst.get_property::<OsString>(DEVPKEY_Device_InstanceId)?;
+    let mut devinst = devinst;
+
+    if instance_id.to_string_lossy().starts_with("USB\\ROOT_HUB") {
+        return None;
+    }
+
+    log::debug!("Probing serial device {}", instance_id.display());
+
+    // Limit the number of iterations to avoid infinite loops,
+    // even though it's unlikely to happen.
+    let n = 100;
+
+    for _ in 0..n {
+        let interfaces = devinst.interfaces(GUID_DEVINTERFACE_USB_DEVICE);
+
+        let paths = interfaces.iter().count();
+
+        if paths > 0 {
+            return probe_device(devinst);
+        }
+
+        let instance_id = devinst.get_property::<OsString>(DEVPKEY_Device_Parent)?;
+
+        let parent_id: WCString = WCString::from(instance_id.as_os_str());
+
+        devinst = DevInst::from_instance_id(&parent_id)?;
+    }
+
+    // The code will go up the device tree until it ends up at the root of the device tree,
+    // where there is no parent. So this part should never be reached.
+    unreachable!("Failed to find parent USB device, and did not reach root of the device tree")
 }
 
 pub fn probe_device(devinst: DevInst) -> Option<DeviceInfo> {
