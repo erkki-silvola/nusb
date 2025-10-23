@@ -25,7 +25,9 @@ use windows_sys::Win32::{
 
 use crate::{
     hotplug::HotplugEvent,
-    platform::windows_winusb::{cfgmgr32::get_device_interface_property, util::WCString},
+    platform::windows_winusb::{
+        cfgmgr32::get_device_interface_property, enumeration::probe_serial_device, util::WCString,
+    },
     DeviceId, Error,
 };
 
@@ -145,7 +147,7 @@ impl WindowsHotplugWatch {
                 };
             }
             Some((Action::SerialConnect, devinst)) => {
-                if let Some(dev) = probe_device(devinst) {
+                if let Some(dev) = probe_serial_device(devinst) {
                     return Poll::Ready(HotplugEvent::SerialConnected(dev));
                 };
             }
