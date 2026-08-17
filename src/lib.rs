@@ -376,6 +376,9 @@ pub fn list_buses() -> impl MaybeFuture<Output = Result<impl Iterator<Item = Bus
 ///         HotplugEvent::Connected(d) => {
 ///             devices.insert(d.id(), d);
 ///         }
+///         HotplugEvent::SerialConnected(d) => {
+///             println!("Seria port connected: {d:?}");
+///         }
 ///         HotplugEvent::Disconnected(id) => {
 ///             devices.remove(&id);
 ///         }
